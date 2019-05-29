@@ -3,7 +3,7 @@ from __future__ import print_function, division
 
 from keras.datasets import mnist
 from keras.layers.merge import _Merge
-from keras.layers import Input, Dense, Reshape, Flatten, Dropout
+from keras.layers import Input, Dense, Reshape, Flatten, Dropout, Lambda
 from keras.layers import BatchNormalization, Activation, ZeroPadding1D
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.convolutional import UpSampling2D, Conv2DTranspose
@@ -17,6 +17,10 @@ import keras.backend as K
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import zoomed_inset_axes
+from mpl_toolkits.axes_grid1.inset_locator import mark_inset
+import matplotlib.gridspec as gridspec
+plt.style.use('seaborn')
 
 import random
 from scipy import signal
@@ -33,15 +37,17 @@ batch_outpath = "/data/public_html/2107829/MSci_Project/batch_samples/batch%05d.
 loss_path = "/data/public_html/2107829/MSci_Project/"
 max_itr = 2*1000                                                # max no of steps/iterations
 sample_rate = 1024
-s_type = 'MIX'                                                   # Type of signal to generate 'SG' = sine gaussian, 'RD' = ringdonw, 'WNB' = white noise burst, 'MIX' = random mix of the three.
+s_type = 'SG'                                                   # Type of signal to generate 'SG' = sine gaussian, 'RD' = ringdonw, 'WNB' = white noise burst, 'MIX' = random mix of the three.
 noise_switch = 'off'                                            # 'off' = no noise added to signal 'on' = noise added
 #A = 1.0                                                         # Amplitude                        
 t = np.linspace(0,1,sample_rate)                                # time vector in a 1 second range
 phi = 2*np.pi
-batch_size = 25
+batch_size = 32
 gps_time = 1215265166.000                                       # arbitrarily chosen
-hp_d = 32							# hyper perameter that determines model size/filters
-hp_g = 32
+hp_d = 64							# hyper perameter that determines model size/filters
+hp_g = 64
+GP_weight = 10
+
 def clean_signals(s_type):
     '''
     This generates Sine Gaussian, ringdown and white noise burst signals depending on what you want.
@@ -137,21 +143,59 @@ def sig_gen(batch_size,s_type):
             signals_offset.append(noisy('gauss',h_offset,noise_switch))
     return np.array(signals).reshape(batch_size,sample_rate),np.array(signals_offset).reshape(batch_size,sample_rate)
 
-def combine_gen_images(signals, nrows=5, ncols=5):
-    '''
-    Makes a 5x5 tile figure from a sample of a given signal array.
-    '''
-    signals = np.dstack(np.stack((signals),axis=1))
-    fig, axs = plt.subplots(nrows, ncols, figsize=(20,10))
-    fig.suptitle("Generated Samples", fontsize=18)
-    fig.text(0.5, 0.04, 'Time (s)', ha='center', fontsize=20)
-    fig.text(0.04, 0.5, 'Amplitude', va='center', rotation='vertical',fontsize=20)
-    axs = axs.ravel()
+def plotter(signals,losses,epoch,legend=None):
+    
+    signals = np.dstack(np.stack((signals),axis=2))
+    batch_signal,batch_signal_delay = signals
+    fig = plt.figure(figsize=(25, 25))
 
-    for i in range(nrows*ncols):
-        axs[i].plot(t,signals[i][0],'b')# plots the signals
-        axs[i].plot(t,signals[i][1],'g')# plots the offset
-        axs[i].set_ylim([-1,1])
+    outer = gridspec.GridSpec(4, 4, wspace=0.2, hspace=0.2)
+    loss_inner = gridspec.GridSpecFromSubplotSpec(1, 1,
+                    subplot_spec=outer[6:8], wspace=0.3, hspace=0.3)
+    
+    # plot losses
+    
+    losses = np.array(losses)
+    ax1 = plt.Subplot(fig,loss_inner[0])
+    ax1.plot(losses[:,0],'g')
+    if losses.shape[1]>2:
+        ax1.plot(losses[:,2],'r')
+    ax1.set_ylabel(r'loss')
+    if legend is not None:
+        ax1.legend(legend,loc='upper left')
+
+  
+    
+    
+    fig.add_subplot(ax1)
+
+    for i in range(6):
+        inner = gridspec.GridSpecFromSubplotSpec(2, 1,
+                    subplot_spec=outer[i], wspace=0.3, hspace=0.3)
+
+        for j in range(2):
+            ax = plt.Subplot(fig, inner[j])
+
+            if j==0:
+                ax.plot(t,batch_signal[i])
+                ax.plot(t,batch_signal_delay[i])
+                ax.set_ylim(-1,1)
+            if j==1:
+                x1 = np.argmax(batch_signal[i]) - 100
+                x2 = np.argmax(batch_signal_delay[i]) + 100
+                ax.plot(t[x1:x2], batch_signal[i][x1:x2])
+                ax.plot(t[x1:x2], batch_signal_delay[i][x1:x2])      
+            
+            #mark_inset(ax, ax, loc1=1, loc2=2, fc="none", ec="0.5")
+            #ax.set_xticks([])
+            #ax.set_yticks([])
+        
+            fig.add_subplot(ax)
+        
+        
+        
+            
+    plt.suptitle("Generated Samples:{0}".format(epoch), y=0.92,fontsize=25)
     return fig
 
 def combine_batch_images(signals, nrows=5, ncols=5):
@@ -207,12 +251,12 @@ def plot_losses(losses,filename,logscale=False,legend=None):
     fig = plt.figure()
     losses = np.array(losses)
     ax1 = fig.add_subplot(211)
-    ax1.plot(losses[:,0],'g')
+    #ax1.plot(losses[:,0],'g')
     if losses.shape[1]>2:
-        ax1.plot(losses[:,2],'r')
+        ax1.plot(losses[:,2]*-1,'r',alpha=0.5)
     ax1.set_ylabel(r'loss')
     if legend is not None:
-        ax1.legend(legend,loc='upper left')
+        ax1.legend(legend)#,loc='upper left')
 
     # plot accuracies
     #ax2 = fig.add_subplot(212)
@@ -249,7 +293,8 @@ class WGANGP():
 
         # Following parameter and optimizer set as recommended in paper
         self.n_critic = 5
-        optimizer = Adam(lr=1e-4,beta_1=0.5,beta_2=0.9) # original WGAN says use RMSprop but Adam is fine and recommended by WaveGAN paper
+        d_optimizer = Adam(lr=1e-4,beta_1=0.5,beta_2=0.9) # original WGAN says use RMSprop but Adam is fine and recommended by WaveGAN paper
+	g_optimizer = Adam(lr=1e-4, beta_1=0.5,beta_2=0.9)
 
         # Build the generator and critic
         self.generator = self.build_generator()
@@ -291,8 +336,8 @@ class WGANGP():
         self.critic_model.compile(loss=[self.wasserstein_loss,
                                               self.wasserstein_loss,
                                               partial_gp_loss],
-                                        optimizer=optimizer,
-                                        loss_weights=[1, 1, 10],metrics=['accuracy'])
+                                        optimizer=d_optimizer,
+                                        loss_weights=[1, 1, GP_weight],metrics=['accuracy'])
         #-------------------------------
         # Construct Computational Graph
         #         for Generator
@@ -310,7 +355,7 @@ class WGANGP():
         valid = self.critic(img)
         # Defines generator model
         self.generator_model = Model(z_gen, valid)
-        self.generator_model.compile(loss=self.wasserstein_loss, optimizer=optimizer)
+        self.generator_model.compile(loss=self.wasserstein_loss, optimizer=g_optimizer)
 
 
     def gradient_penalty_loss(self, y_true, y_pred, averaged_samples):
@@ -363,20 +408,21 @@ class WGANGP():
 	act = 'relu'
 	
         model.add(Dense(256*hp_g, input_dim=self.latent_dim))
-	model.add(Activation(act))
 	model.add(Reshape((1,16,16*hp_g)))
+	model.add(Activation(act))
 
         model.add(Conv2DTranspose(8*hp_g, strides = (1,4), kernel_size=(1,ks), padding=pad))
-	#model.add(BatchNormalization(momentum=0.8))
+	model.add(BatchNormalization(momentum=0.8))
 	model.add(Activation(act))
 
         model.add(Conv2DTranspose(4*hp_g,strides=(1,4), kernel_size=(1,ks), padding=pad))
-	#model.add(BatchNormalization(momentum=0.8))
+	model.add(BatchNormalization(momentum=0.8))
 	model.add(Activation(act))
 
         model.add(Conv2DTranspose(self.channels, strides = (1,4), kernel_size=(1,ks), padding=pad))
- 	model.add(Activation("tanh"))
 	model.add(Reshape((1024,2)))
+	model.add(Activation("tanh"))
+	
         model.summary()
 
         noise = Input(shape=(self.latent_dim,))
@@ -388,24 +434,33 @@ class WGANGP():
 	'''
 	Note no sigmoid output as we're not wanting a probability. Instead the output should be large and	 positive for real and large and negative for fake.
 	'''
+	#hp_n = 2
+	#def phase_shuffle(x):
+         #   shuffle_amount = random.randint(-1*hp_n, hp_n)
+         #   return K.concatenate((x[shuffle_amount:, :], x[:shuffle_amount, :]), axis=0)
 
         model = Sequential()
 	pad = "same"
 	ks = 25
 
-        model.add(Conv1D(16*hp_d, kernel_size=ks, strides=4, input_shape=self.img_shape, padding=pad))
+        model.add(Conv1D(4*hp_d, kernel_size=ks, strides=4, input_shape=self.img_shape, padding=pad))
 	model.add(LeakyReLU(alpha=0.2))
-	#model.add(Dropout(0.25))
+	#model.add(Dropout(0.3))
+	#model.add(Lambda(lambda x: phase_shuffle(x)))
 
         model.add(Conv1D(8*hp_d, kernel_size=ks, strides=4, padding=pad))
-        model.add(LeakyReLU(alpha=0.2))
-        #model.add(BatchNormalization(momentum=0.8))
-	#model.add(Dropout(0.25))
-
-        model.add(Conv1D(4*hp_d, kernel_size=ks, strides=4, padding=pad))
-        #model.add(BatchNormalization(momentum=0.8))
 	model.add(LeakyReLU(alpha=0.2))
-        #model.add(Dropout(0.25)) 
+	#model.add(Dropout(0.3))
+	#model.add(Lambda(lambda x: phase_shuffle(x)))
+
+        #model.add(Conv1D(8*hp_d, kernel_size=ks, strides=4, padding=pad))
+	#model.add(LeakyReLU(alpha=0.2))
+	#model.add(Dropout(0.3))
+
+	model.add(Conv1D(16*hp_d, kernel_size=ks, strides=4, padding=pad))
+	model.add(LeakyReLU(alpha=0.2))
+	#model.add(Dropout(0.3))
+
 	model.add(Flatten())
         model.add(Dense(1))
 
@@ -426,8 +481,8 @@ class WGANGP():
        # X_train = np.expand_dims(X_train, axis=3)
 
         # Adversarial ground truths
-        valid = -np.ones((batch_size, 1)) 	# switching labels seems to work better
-        fake = np.ones((batch_size, 1))
+        valid = np.ones((batch_size, 1)) 	# switching labels seems to work better
+        fake = -np.ones((batch_size, 1))
         dummy = np.zeros((batch_size, 1)) # Dummy gt for gradient penalty
 	
 	#valid_d = [np.random.uniform(-0.9,-1) for i in range(batch_size)]
@@ -468,15 +523,31 @@ class WGANGP():
 		print ("%d [D loss: %f] [G loss: %f]" % (epoch, d_loss[0], g_loss))
  		noise = np.random.uniform(size=[batch_size, 100], low=-1.0, high=1.0)
 		generated_signals = self.generator.predict(noise)
-                gen_image = combine_gen_images(generated_signals)
-		gen_image.savefig(outpath % epoch)
+                gen_image = plotter(generated_signals,losses,epoch,legend=['Generator','Discriminator'])
+		gen_image.savefig(outpath % epoch,bbox_inches='tight')
 		batch_image = combine_batch_images(X_train)
                 batch_image.savefig(batch_outpath % epoch)
-		plot_losses(losses,'%s/losses.png' % loss_path,logscale=False, legend=['Generator','Discriminator'])
+		plot_losses(losses,'%s/losses.png' % loss_path,logscale=False, legend=['Critic'])
 		#d_loss_train = self.critic_model.test_on_batch([X_train],[valid,dummy])
-		#print(d_loss_train)
 
+		#print(d_loss_train)i
+		self.save_model()
+    
+    def save_model(self):
 
+        def save(model, model_name):
+            model_path = "saved_model/%s.json" % model_name
+            weights_path = "saved_model/%s_weights.hdf5" % model_name
+            options = {"file_arch": model_path,
+                        "file_weight": weights_path}
+            json_string = model.to_json()
+            open(options['file_arch'], 'w').write(json_string)
+            model.save_weights(options['file_weight'])
+
+        save(self.generator, "generatorf")
+        save(self.critic, "criticf")
+    
+    
 
 if __name__ == '__main__':
     wgan = WGANGP()
